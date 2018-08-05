@@ -14,18 +14,51 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#include <linux/limits.h> //PATH_MAX
+
+#include "EoControl.c"
+
+static const char version[] = "\n@ open62541-dd Version 1.00\n";
 
 #undef UA_ENABLE_METHODCALLS
 
-#define EO_TEMP_NAME "eo_temperature"
-#define EO_HUMI_NAME "eo_humidity"
-#define EO_CO2_NAME  "eo_co2"
-#define EO_SW_NAME   "eo_switch"
-#define EO_TEMP_ID   "eo.temperature"
-#define EO_HUMI_ID   "eo.humidity"
-#define EO_CO2_ID    "eo.co2"
-#define EO_SW_ID     "eo.switch"
+#define EO_DIRECTORY "/var/tmp/dpride"
+#define PID_FILE "opcua.pid"
 
+#define DEFAULT_PORT 16664
+#define DOMAIN_LENGTH 256
+
+#define SC_SIZE 16
+#define NODE_TABLE_SIZE 256
+
+#define SIGENOCEAN (SIGRTMIN + 6)
+
+#if 0
+typedef struct _eodata {
+        int  Index;
+        int  Id;
+        char *Eep;
+        char *Name;
+        char *Desc;
+        int  PIndex;
+        int  PCount;
+        double Value;
+}
+EO_DATA;
+#endif
+
+void EoSignalAction(int signo, void (*func)(int));
+void ExamineEvent(int Signum, siginfo_t *ps, void *pt);
+char *EoMakePath(char *Dir, char *File);
+INT EoReflesh(void);
+EO_DATA *EoGetDataByIndex(int Index);
+
+//
+int Port;
+char *Domain;
+int Dflag = 0;
 
 typedef FILE* HANDLE;
 typedef char TCHAR;
@@ -34,93 +67,107 @@ typedef int BOOL;
 UA_Boolean running = true;
 UA_Logger logger = UA_Log_Stdout;
 
+enum EventStatus {
+	NoEntry = 0,
+	NoData = 1,
+	DataExists = 2
+};
+
+enum EventStatus PatrolTable[NODE_TABLE_SIZE];
+
+//
 static void
 writeVariable(UA_Server *server, int data, char *name);
 
-static int getTemperature();
-
-static int getHumidity();
-
-static int getCo2();
-
-static int getSwitch();
-
-static int getBridgeData(TCHAR *lpFileName)
-{
-	HANDLE hFile;
-	char szBuff[32];
-	BOOL bRet;
-
-	hFile = fopen(lpFileName, "r");
-	if (hFile == NULL) {
-		printf("OpenFile Failed\r\n");
-		return 1;
-	}
-
-	bRet = fread(szBuff, sizeof(szBuff[0]), sizeof(szBuff) / sizeof(szBuff[0]), hFile);
-	if (!bRet) {
-		printf("ReadFile Failed\r\n");
-		fclose(hFile);
-		return 1;
-	}
-
-	int data = atoi(szBuff);
-
-	fclose(hFile);
-
-	return data;
-}
-
-static int getTemperature()
-{
-	int data = getBridgeData("/var/tmp/temp");
-	//printf("*temp=%d\r\n", data);
-	return data;
-}
-
-static int getHumidity()
-{
-	int data = getBridgeData("/var/tmp/humi");
-	//printf("*humi=%d\r\n", data);
-	return data;
-}
-
-static int getCo2()
-{
-	int data = getBridgeData("/var/tmp/co2");
-	//printf("*co2=%d\r\n", data);
-	return data;
-}
-
-static int getSwitch()
-{
-	int data = getBridgeData("/var/tmp/switch");
-	//printf("*switch=%d\r\n", data);
-	return data;
-}
-
 static void
-enoceanCallback(UA_Server *server, void *data) {
-	int temp = getTemperature();
-	int humi = getHumidity();
-	int co2 = getCo2();
-	int sw = getSwitch();
+enoceanCallback(UA_Server *server, void *data)
+{
+	enum {itemLength = 64,
+	      fullNameLength = 128
+	};
+	int i;
+        EO_DATA *pe;
+	enum EventStatus es;
+	char text[BUFSIZ];
+	char item[itemLength];
+	char fullName[fullNameLength];
+	int remainLength = fullNameLength - strlen(Domain) - 1;
 
-	const int textSize = 128;
-	char text[textSize];
-
-	sprintf(text, "enoceancallback: %d %d %d %d", temp, humi, co2, sw);
-
-	UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, (char *)text);
-
-	writeVariable(server, temp, EO_TEMP_ID);
-	writeVariable(server, humi, EO_HUMI_ID);
-	writeVariable(server, co2, EO_CO2_ID);
-	writeVariable(server, sw, EO_SW_ID);
+	for (i = 0; i < NODE_TABLE_SIZE; i++) {
+		es = PatrolTable[i];
+		if (es == NoEntry) {
+			break;
+		}
+		else if (es == DataExists) {
+			PatrolTable[i] = NoData;
+			strcpy(text, "enoceancallback: ");
+			while((pe = EoGetDataByIndex(i)) != NULL) {
+				printf("$$R:%d: %08X %d:%s=(%.2lf)\n",
+				       i, pe->Id, pe->PIndex, pe->Name, pe->Value);
+				strcpy(fullName, Domain);
+				strncat(fullName, pe->Name, remainLength);
+				writeVariable(server, pe->Value, fullName);
+				sprintf(item, "%s=%.2lf ",  fullName, pe->Value);
+				strncat(text, item, (BUFSIZ - 1) - strlen(text));
+			}
+			UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, (char *)text);
+		}
+	}
 }
 
-static void stopHandler(int sign) {
+char *EoMakePath(char *Dir, char *File);
+INT EoReflesh(void);
+EO_DATA *EoGetDataByIndex(int Index);
+
+//
+//
+static char *PidPath;
+
+//
+//
+//
+void EoSignalAction(int signo, void (*func)(int))
+{
+        struct sigaction act, oact;
+
+        if (signo == SIGENOCEAN)
+        {
+                act.sa_sigaction = (void(*)(int, siginfo_t *, void *)) func;
+                sigemptyset(&act.sa_mask);
+                act.sa_flags = SA_SIGINFO;
+        }
+        else
+        {
+                act.sa_handler = func;
+                sigemptyset(&act.sa_mask);
+                act.sa_flags = SA_RESTART;
+        }
+        if (sigaction(signo, &act, &oact) < 0)
+        {
+                fprintf(stderr, "error at sigaction\n");
+        }
+}
+
+void ExamineEvent(int Signum, siginfo_t *ps, void *pt)
+{
+	int index;
+        char message[6] = {">>>0\n"};
+        index = (unsigned long) ps->si_value.sival_int;
+	PatrolTable[index] = DataExists;
+        message[3] = '0' + index;
+        write(1, message, 6);
+}
+
+//
+//
+//
+static void stopHandler(int sign)
+{
 	UA_LOG_INFO(logger, UA_LOGCATEGORY_SERVER, "Received Ctrl-C");
+
+	if (PidPath) {
+                unlink(PidPath);
+        }
 	running = 0;
 }
 
@@ -142,7 +189,6 @@ readTimeData(void *handle, const UA_NodeId nodeId, UA_Boolean sourceTimeStamp,
 	}
 	return UA_STATUSCODE_GOOD;
 }
-
 
 /**
 * Now we change the value with the write service. This uses the same service
@@ -202,21 +248,92 @@ addVariable(UA_Server *server, char *name, char *id, UA_Int32 initValue) {
 	UA_Variant_deleteMembers(&myVar.value);
 }
 
-int main(int argc, char** argv) {
-	signal(SIGINT, stopHandler); /* catches ctrl-c */
+int
+main(int argc, char *argv[])
+{
+	int i;
+	int opt;
+	int itemCount;
+	int totalCount;
+	pid_t myPid = getpid();
+	FILE *f;
+	Port = DEFAULT_PORT;
+        EO_DATA *pe;
+	enum {
+		fullNameLength = 128
+        };
+	char fullName[fullNameLength];
+	int remainLength;
 
-	UA_ServerNetworkLayer nl = UA_ServerNetworkLayerTCP(UA_ConnectionConfig_standard, 16664);
+	printf(version);
+	
+	Domain = "\0"; /* Defailt Domain name is NULL */ 
+	while ((opt = getopt(argc, argv, "Dd:p:")) != EOF) {
+		switch (opt) {
+		case 'D':
+			Dflag++;
+			break;
+
+		case 'd':
+			Domain = strndup(optarg, DOMAIN_LENGTH);
+			break;
+
+		case 'p':
+			Port = atoi(optarg);
+			break;
+
+		default: /* '?' */
+			fprintf(stderr, "Usage: %s [-D][-d domain-name] [-p] port#\n",
+				argv[0]);
+			exit(EXIT_FAILURE);
+		}
+	}
+	remainLength = fullNameLength - strlen(Domain) - 1;
+
+        PidPath = EoMakePath(EO_DIRECTORY, PID_FILE);
+        f = fopen(PidPath, "w");
+        if (f == NULL)
+        {
+                fprintf(stderr, ": cannot create pid file=%s\n",
+                        PidPath);
+                return 1;
+        }
+        fprintf(f, "%d\n", myPid);
+        fclose(f);
+        printf("PID=%d file=%s\n", myPid, PidPath);
+	printf("%s: D=%d; domain=%s; port=%d; optind=%d\n",
+	       argv[0], Dflag, Domain, Port, optind);
+	
+	signal(SIGINT, stopHandler); /* catches ctrl-c */
+	signal(SIGTERM, stopHandler); /* catches ctrl-c */
+        EoSignalAction(SIGENOCEAN, (void(*)(int)) ExamineEvent);
+
+	UA_ServerNetworkLayer nl = UA_ServerNetworkLayerTCP(UA_ConnectionConfig_standard, Port);
 	UA_ServerConfig config = UA_ServerConfig_standard;
 	config.networkLayers = &nl;
 	config.networkLayersSize = 1;
 
 	UA_Server *server = UA_Server_new(config);
 
-	addVariable(server, EO_TEMP_NAME, EO_TEMP_ID, 0);
-	addVariable(server, EO_HUMI_NAME, EO_HUMI_ID, 0);
-	addVariable(server, EO_CO2_NAME, EO_CO2_ID, 0);
-	addVariable(server, EO_SW_NAME, EO_SW_ID, 0);
-
+	EoReflesh();
+	totalCount = 0;
+	for(i = 0; i < NODE_TABLE_SIZE; i++) {
+		itemCount = 0;
+		totalCount++;
+		while((pe = EoGetDataByIndex(i)) != NULL)
+                {
+			itemCount++;
+			strcpy(fullName, Domain);
+			strncat(fullName, pe->Name, remainLength);
+			addVariable(server, pe->Name, fullName, 0);
+		}
+		if (itemCount == 0) {
+			printf("Found last line=%d\n", i);
+			break;
+		}
+		PatrolTable[i] = NoData;
+	}
+	
 	/* add a variable with the datetime data source */
 	//UA_DataSource dateDataSource = (UA_DataSource) { .handle = NULL, .read = readTimeData, .write = NULL };
 	UA_DataSource dateDataSource;
@@ -295,31 +412,27 @@ int main(int argc, char** argv) {
 	}
 
 	/* Add the variable to some more places to get a node with three inverse references for the CTT */
+#if 0
 	UA_ExpandedNodeId temp_nodeid = UA_EXPANDEDNODEID_STRING(1, EO_TEMP_ID);
-	UA_ExpandedNodeId humi_nodeid = UA_EXPANDEDNODEID_STRING(1, EO_HUMI_ID);
-	UA_ExpandedNodeId co2_nodeid = UA_EXPANDEDNODEID_STRING(1, EO_CO2_ID);
-	UA_ExpandedNodeId sw_nodeid = UA_EXPANDEDNODEID_STRING(1, EO_SW_ID);
-
 	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, DEMOID),
 		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), temp_nodeid, true);
 	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, SCALARID),
 		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), temp_nodeid, true);
-
-	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, DEMOID),
-		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), humi_nodeid, true);
-	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, SCALARID),
-		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), humi_nodeid, true);
-
-	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, DEMOID),
-		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), co2_nodeid, true);
-	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, SCALARID),
-		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), co2_nodeid, true);
-
-	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, DEMOID),
-		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), sw_nodeid, true);
-	UA_Server_addReference(server, UA_NODEID_NUMERIC(1, SCALARID),
-		UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), sw_nodeid, true);
-
+#endif
+	for(i = 0; i < totalCount; i++) {
+		UA_ExpandedNodeId extended_nodeid;
+		while((pe = EoGetDataByIndex(i)) != NULL)
+                {
+			strcpy(fullName, Domain);
+			strncat(fullName, pe->Name, remainLength);
+			extended_nodeid = UA_EXPANDEDNODEID_STRING(1, fullName);
+			UA_Server_addReference(server, UA_NODEID_NUMERIC(1, DEMOID),
+					       UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), extended_nodeid, true);
+			UA_Server_addReference(server, UA_NODEID_NUMERIC(1, SCALARID),
+					       UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES), extended_nodeid, true);
+		}
+	}
+	
 	/* Example for manually setting an attribute within the server */
 	UA_LocalizedText objectsName = UA_LOCALIZEDTEXT("en_US", "Objects");
 	UA_Server_writeDisplayName(server, UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER), objectsName);
@@ -329,8 +442,7 @@ int main(int argc, char** argv) {
 		job.job.methodCall.method = enoceanCallback, job.job.methodCall.data = NULL;
 
 	//UA_Server_addRepeatedJob(server, job, 2000, NULL); /* call every 2 sec */
-	UA_Server_addRepeatedJob(server, job, 10 * 1000, NULL); /* call every 10 sec */
-
+	UA_Server_addRepeatedJob(server, job, 1 * 1000, NULL); /* call every 1 sec */
 															/* run server */
 	UA_StatusCode retval = UA_Server_run(server, &running); /* run until ctrl-c is received */
 
