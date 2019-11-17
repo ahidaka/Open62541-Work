@@ -16,26 +16,30 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <linux/limits.h> //PATH_MAX
+#define EXTERNAL_BROKER 1
+#include "../dpride/typedefs.h"
+#include "../dpride/utils.h"
+#include "../dpride/dpride.h"
+#include "../dpride/node.c"
+#include "../dpride/eologfile.c"
+#include "../dpride/EoControl.c"
 
-#include "EoControl.c"
-
-static const char version[] = "\n@ open62541-dd Version 1.00\n";
+static const char version[] = "\n@ open62541-dd Version 1.10 \n";
 
 #undef UA_ENABLE_METHODCALLS
 
 #define EO_DIRECTORY "/var/tmp/dpride"
-#define PID_FILE "opcua.pid"
+#define UA_PID_FILE "opcua.pid"
 
-#define DEFAULT_PORT 16664
-#define DOMAIN_LENGTH 256
-
-#define SC_SIZE 16
-#define NODE_TABLE_SIZE 256
+#define DEFAULT_PORT (16664)
+#define DOMAIN_LENGTH (256)
 
 #define SIGENOCEAN (SIGRTMIN + 6)
 
 #if 0
+#define SC_SIZE (16)
+#define NODE_TABLE_SIZE (256)
+#define EO_DATSIZ (8)
 typedef struct _eodata {
         int  Index;
         int  Id;
@@ -44,7 +48,7 @@ typedef struct _eodata {
         char *Desc;
         int  PIndex;
         int  PCount;
-        double Value;
+        char Data[EO_DATSIZ];
 }
 EO_DATA;
 #endif
@@ -54,11 +58,14 @@ void ExamineEvent(int Signum, siginfo_t *ps, void *pt);
 char *EoMakePath(char *Dir, char *File);
 INT EoReflesh(void);
 EO_DATA *EoGetDataByIndex(int Index);
+FILE *EoLogInit(char *Prefix, char *Extension);
+void EoLog(char *id, char *eep, char *msg);
 
 //
 int Port;
 char *Domain;
 int Dflag = 0;
+int Lflag = 0;
 
 typedef FILE* HANDLE;
 typedef char TCHAR;
@@ -83,12 +90,15 @@ static void
 enoceanCallback(UA_Server *server, void *data)
 {
 	enum {itemLength = 64,
-	      fullNameLength = 128
+	      fullNameLength = 128,
+	      bufferLength = BUFSIZ/4,
 	};
 	int i;
         EO_DATA *pe;
 	enum EventStatus es;
-	char text[BUFSIZ];
+	double value;
+	char text[bufferLength];
+	char logBuffer[bufferLength];
 	char item[itemLength];
 	char fullName[fullNameLength];
 	int remainLength = fullNameLength - strlen(Domain) - 1;
@@ -102,22 +112,27 @@ enoceanCallback(UA_Server *server, void *data)
 			PatrolTable[i] = NoData;
 			strcpy(text, "enoceancallback: ");
 			while((pe = EoGetDataByIndex(i)) != NULL) {
-				printf("$$R:%d: %08X %d:%s=(%.2lf)\n",
-				       i, pe->Id, pe->PIndex, pe->Name, pe->Value);
+				value = strtod(pe->Data, NULL);
+				if (Dflag | Lflag) {
+					sprintf(logBuffer, "%d: %08X %d:%s=(%s)",
+						i, pe->Id, pe->PIndex, pe->Name, pe->Data);
+					if (Dflag) {
+						printf("Debug:%s\n", logBuffer);
+					}
+					if (Lflag) {
+						EoLog(Domain, logBuffer, "");
+					}
+				}
 				strcpy(fullName, Domain);
 				strncat(fullName, pe->Name, remainLength);
-				writeVariable(server, pe->Value, fullName);
-				sprintf(item, "%s=%.2lf ",  fullName, pe->Value);
-				strncat(text, item, (BUFSIZ - 1) - strlen(text));
+				writeVariable(server, value, fullName);
+				sprintf(item, "%s=%s ",  fullName, pe->Data);
+				strncat(text, item, (bufferLength - 1) - strlen(text));
 			}
 			UA_LOG_INFO(UA_Log_Stdout, UA_LOGCATEGORY_USERLAND, (char *)text);
 		}
 	}
 }
-
-char *EoMakePath(char *Dir, char *File);
-INT EoReflesh(void);
-EO_DATA *EoGetDataByIndex(int Index);
 
 //
 //
@@ -268,10 +283,14 @@ main(int argc, char *argv[])
 	printf(version);
 	
 	Domain = "\0"; /* Defailt Domain name is NULL */ 
-	while ((opt = getopt(argc, argv, "Dd:p:")) != EOF) {
+	while ((opt = getopt(argc, argv, "Dd:Lp:")) != EOF) {
 		switch (opt) {
 		case 'D':
 			Dflag++;
+			break;
+
+		case 'L':
+			Lflag++;
 			break;
 
 		case 'd':
@@ -290,7 +309,7 @@ main(int argc, char *argv[])
 	}
 	remainLength = fullNameLength - strlen(Domain) - 1;
 
-        PidPath = EoMakePath(EO_DIRECTORY, PID_FILE);
+        PidPath = EoMakePath(EO_DIRECTORY, UA_PID_FILE);
         f = fopen(PidPath, "w");
         if (f == NULL)
         {
@@ -301,11 +320,18 @@ main(int argc, char *argv[])
         fprintf(f, "%d\n", myPid);
         fclose(f);
         printf("PID=%d file=%s\n", myPid, PidPath);
-	printf("%s: D=%d; domain=%s; port=%d; optind=%d\n",
-	       argv[0], Dflag, Domain, Port, optind);
+	printf("%s: D=%d; L=%d; domain=%s; port=%d; optind=%d\n",
+	       argv[0], Dflag, Lflag, Domain, Port, optind);
+
+	if (Lflag) {
+		char buf[12];
+		sprintf(buf, "%d", Port);
+		(void) EoLogInit("opc", ".log");
+                EoLog("Start", Domain, buf);
+	}
 	
 	signal(SIGINT, stopHandler); /* catches ctrl-c */
-	signal(SIGTERM, stopHandler); /* catches ctrl-c */
+	signal(SIGTERM, stopHandler); /* catches kill -15 */
         EoSignalAction(SIGENOCEAN, (void(*)(int)) ExamineEvent);
 
 	UA_ServerNetworkLayer nl = UA_ServerNetworkLayerTCP(UA_ConnectionConfig_standard, Port);
@@ -316,6 +342,9 @@ main(int argc, char *argv[])
 	UA_Server *server = UA_Server_new(config);
 
 	EoReflesh();
+	if (Lflag) {
+		EoLog("EoReflesh", "", "");
+	}
 	totalCount = 0;
 	for(i = 0; i < NODE_TABLE_SIZE; i++) {
 		itemCount = 0;
