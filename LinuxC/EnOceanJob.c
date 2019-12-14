@@ -84,7 +84,7 @@ enum EventStatus PatrolTable[NODE_TABLE_SIZE];
 
 //
 static void
-writeVariable(UA_Server *server, int data, char *name);
+writeVariable(UA_Server *server, double data, char *name);
 
 static void
 enoceanCallback(UA_Server *server, void *data)
@@ -211,15 +211,15 @@ readTimeData(void *handle, const UA_NodeId nodeId, UA_Boolean sourceTimeStamp,
 */
 
 static void
-writeVariable(UA_Server *server, int data, char *idName) {
-	UA_NodeId myIntegerNodeId = UA_NODEID_STRING(1, idName);
+writeVariable(UA_Server *server, double data, char *idName) {
+	UA_NodeId myDoubleNodeId = UA_NODEID_STRING(1, idName);
 
 	/* Write a different integer value */
-	UA_Int32 myInteger = data; //43
+	UA_Double myDouble = data;
 	UA_Variant myVar;
 	UA_Variant_init(&myVar);
-	UA_Variant_setScalar(&myVar, &myInteger, &UA_TYPES[UA_TYPES_INT32]);
-	UA_Server_writeValue(server, myIntegerNodeId, myVar);
+	UA_Variant_setScalar(&myVar, &myDouble, &UA_TYPES[UA_TYPES_DOUBLE]);
+	UA_Server_writeValue(server, myDoubleNodeId, myVar);
 
 	/* Set the status code of the value to an error code. The function
 	* UA_Server_write provides access to the raw service. The above
@@ -227,7 +227,7 @@ writeVariable(UA_Server *server, int data, char *idName) {
 	* attribute with the write service. */
 	UA_WriteValue wv;
 	UA_WriteValue_init(&wv);
-	wv.nodeId = myIntegerNodeId;
+	wv.nodeId = myDoubleNodeId;
 	wv.attributeId = UA_ATTRIBUTEID_VALUE;
 	wv.value.status = UA_STATUSCODE_BADNOTCONNECTED;
 	wv.value.hasStatus = true;
@@ -241,25 +241,25 @@ writeVariable(UA_Server *server, int data, char *idName) {
 }
 
 static void
-addVariable(UA_Server *server, char *name, char *id, UA_Int32 initValue) {
+addVariable(UA_Server *server, char *name, char *id, UA_Double initValue) {
 	/* add a static variable node to the server */
 	UA_VariableAttributes myVar;
 	UA_VariableAttributes_init(&myVar);
 
-	UA_Int32 myInteger = initValue;
+	UA_Double myDouble = initValue;
 
 	myVar.description = UA_LOCALIZEDTEXT("en_US", name);
 	myVar.displayName = UA_LOCALIZEDTEXT("en_US", name);
 	myVar.accessLevel = UA_ACCESSLEVELMASK_READ | UA_ACCESSLEVELMASK_WRITE;
 
-	UA_Variant_setScalarCopy(&myVar.value, &myInteger, &UA_TYPES[UA_TYPES_INT32]);
-	const UA_QualifiedName myIntegerName = UA_QUALIFIEDNAME(1, name);
-	const UA_NodeId myIntegerNodeId = UA_NODEID_STRING(1, id);
+	UA_Variant_setScalarCopy(&myVar.value, &myDouble, &UA_TYPES[UA_TYPES_DOUBLE]);
+	const UA_QualifiedName myDoubleName = UA_QUALIFIEDNAME(1, name);
+	const UA_NodeId myDoubleNodeId = UA_NODEID_STRING(1, id);
 
 	UA_NodeId parentNodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
 	UA_NodeId parentReferenceNodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_ORGANIZES);
-	UA_Server_addVariableNode(server, myIntegerNodeId, parentNodeId, parentReferenceNodeId,
-		myIntegerName, UA_NODEID_NULL, myVar, NULL, NULL);
+	UA_Server_addVariableNode(server, myDoubleNodeId, parentNodeId, parentReferenceNodeId,
+		myDoubleName, UA_NODEID_NULL, myVar, NULL, NULL);
 	UA_Variant_deleteMembers(&myVar.value);
 }
 
@@ -354,7 +354,7 @@ main(int argc, char *argv[])
 			itemCount++;
 			strcpy(fullName, Domain);
 			strncat(fullName, pe->Name, remainLength);
-			addVariable(server, pe->Name, fullName, 0);
+			addVariable(server, pe->Name, fullName, 0.0);
 		}
 		if (itemCount == 0) {
 			printf("Found last line=%d\n", i);
